@@ -1,0 +1,108 @@
+---
+# Radoslaw Gorski - Network Automation Lab
+# Ansible playbook for multi-vendor config backup & compliance
+# Use case from Three Ireland / Mars projects - production use
+
+- name: "Multi-Vendor Network Backup & Pre/Post Checks - Production"
+  hosts: network_devices
+  gather_facts: no
+  connection: network_cli
+
+  vars:
+    backup_dir: "./backups/{{ inventory_hostname }}"
+    compliance_dir: "./compliance-reports"
+
+  tasks:
+    - name: Ensure backup directories exist
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+      delegate_to: localhost
+      run_once: false
+
+    - name: Backup Cisco IOS/IOS-XE/NX-OS - running-config
+      cisco.ios.ios_config:
+        backup: yes
+        backup_options:
+          dir_path: "{{ backup_dir }}"
+          filename: "{{ inventory_hostname }}-{{ ansible_date_time.iso8601 }}.cfg"
+      when: ansible_network_os is search('cisco.ios') or ansible_network_os is search('cisco.nxos')
+      register: cisco_backup
+
+    - name: Backup Juniper MX/SRX - configuration
+      junipernetworks.junos.junos_config:
+        backup: yes
+        backup_options:
+          dir_path: "{{ backup_dir }}"
+          filename: "{{ inventory_hostname }}-{{ ansible_date_time.iso8601 }}.conf"
+      when: ansible_network_os is search('junipernetworks.junos')
+
+    - name: Pre-change check - Collect BGP summary
+      cli_command:
+        command: "{{ 'show ip bgp summary' if 'cisco' in ansible_network_os else 'show bgp summary' }}"
+      register: bgp_pre
+
+    - name: Pre-change check - Collect interface status
+      cli_command:
+        command: "{{ 'show ip interface brief' if 'cisco' in ansible_network_os else 'show interfaces terse' }}"
+      register: intf_pre
+
+    - name: Save pre-checks locally
+      copy:
+        content: |
+          ===== PRE-CHECK {{ inventory_hostname }} - {{ ansible_date_time.iso8601 }} =====
+          --- BGP Summary ---
+          {{ bgp_pre.stdout | default('N/A') }}
+
+          --- Interfaces ---
+          {{ intf_pre.stdout | default('N/A') }}
+        dest: "{{ backup_dir }}/pre-check-{{ ansible_date_time.iso8601 }}.txt"
+      delegate_to: localhost
+
+    # --- Example change (commented) - safe for lab ---
+    # - name: Example - Ensure NTP is configured (compliance)
+    #   cisco.ios.ios_config:
+    #     lines:
+    #       - ntp server 10.10.10.1
+    #       - ntp server 10.10.10.2
+
+    - name: Post-change check - Collect BGP summary again
+      cli_command:
+        command: "{{ 'show ip bgp summary' if 'cisco' in ansible_network_os else 'show bgp summary' }}"
+      register: bgp_post
+
+    - name: Generate compliance diff report
+      copy:
+        content: |
+          ===== COMPLIANCE REPORT {{ inventory_hostname }} =====
+          Date: {{ ansible_date_time.iso8601 }}
+          Operator: Radoslaw Gorski
+
+          PRE-CHANGE BGP:
+          {{ bgp_pre.stdout | default('N/A') }}
+
+          POST-CHANGE BGP:
+          {{ bgp_post.stdout | default('N/A') }}
+
+          Result: {{ 'PASS - BGP stable' if bgp_pre.stdout == bgp_post.stdout else 'REVIEW NEEDED' }}
+        dest: "{{ compliance_dir }}/{{ inventory_hostname }}-report-{{ ansible_date_time.iso8601 }}.txt"
+      delegate_to: localhost
+
+    - name: Summary
+      debug:
+        msg: "Backup completed for {{ inventory_hostname }} -> {{ backup_dir }}"
+
+# inventory.ini example:
+# [cisco]
+# leaf-01 ansible_host=10.10.1.10 ansible_network_os=cisco.nxos.nxos
+# spine-01 ansible_host=10.10.1.11 ansible_network_os=cisco.nxos.nxos
+# [juniper]
+# mx-01 ansible_host=10.10.1.20 ansible_network_os=junipernetworks.junos.junos
+# [network_devices:children]
+# cisco
+# juniper
+
+# ansible.cfg:
+# [defaults]
+# inventory = inventory.ini
+# host_key_checking = False
